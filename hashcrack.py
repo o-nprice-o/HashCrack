@@ -1,10 +1,11 @@
 import hashlib
+import multiprocessing
 import os
 import sys
 import string
 import itertools
 import subprocess
-from multiprocessing import Pool, Manager, cpu_count
+import time
 
 def choose_wordlist():
     wordlists_dir = 'wordlists'
@@ -64,41 +65,58 @@ def crack_hash(hash_to_crack, wordlist_path, hash_type):
     print("\nNo match found in the selected wordlist.")
     return None
 
-def hash_matches(args):
-    prefix, hash_to_crack, hash_type, max_length, chars, found_flag = args
-    if found_flag.is_set():
-        return None
-    for length in range(len(prefix), max_length + 1):
-        for suffix in itertools.product(chars, repeat=length - len(prefix)):
-            if found_flag.is_set():
-                return None
-            attempt = prefix + ''.join(suffix)
-            hashed_attempt = hashlib.new(hash_type, attempt.encode()).hexdigest()
-            if hashed_attempt == hash_to_crack:
-                found_flag.set()
-                return attempt
-    return None
+def worker(target_hash, hash_type, charset, max_length, found_event, stop_event, result_queue, progress_queue):
+    for length in range(1, max_length + 1):
+        if stop_event.is_set() or found_event.is_set():
+            return
+        for guess in itertools.product(charset, repeat=length):
+            if stop_event.is_set() or found_event.is_set():
+                return
+            guess_str = ''.join(guess)
+            hashed_guess = hashlib.new(hash_type, guess_str.encode()).hexdigest()
+            if progress_queue:
+                progress_queue.put(1)
+            if hashed_guess == target_hash:
+                found_event.set()
+                result_queue.put(guess_str)
+                return
 
-def multiprocessing_brute_force(hash_to_crack, hash_type, max_length=4):
-    chars = string.ascii_lowercase
-    found_flag = Manager().Event()
-    pool = Pool(cpu_count())
+def multiprocessing_brute_force(target_hash, hash_type, max_length=6, num_workers=4):
+    charset = string.ascii_letters + string.digits
+    found_event = multiprocessing.Event()
+    stop_event = multiprocessing.Event()
+    result_queue = multiprocessing.Queue()
 
-    prefixes = chars  # split search by first char
-    args = [(prefix, hash_to_crack, hash_type, max_length, chars, found_flag) for prefix in prefixes]
+    pool = []
+    try:
+        total = sum(len(charset) ** i for i in range(1, max_length + 1))
+        print(f"[+] Starting brute force: max length {max_length}, total guesses: {total}")
 
-    print(f"\nStarting multiprocessing brute force using {cpu_count()} CPU cores...")
-    results = pool.map(hash_matches, args)
-    pool.close()
-    pool.join()
+        for _ in range(num_workers):
+            p = multiprocessing.Process(target=worker, args=(
+                target_hash, hash_type, charset, max_length, found_event, stop_event, result_queue, None
+            ))
+            pool.append(p)
+            p.start()
 
-    for result in results:
-        if result:
-            print(f"\nSuccess! Hash cracked: {result}")
-            return result
+        while not found_event.is_set():
+            try:
+                time.sleep(0.1)
+            except KeyboardInterrupt:
+                print("\n[!] Interrupted by user. Stopping all processes...")
+                stop_event.set()
+                break
 
-    print("\nNo match found with multiprocessing brute force.")
-    return None
+        if not result_queue.empty():
+            result = result_queue.get()
+            print(f"[✓] Hash cracked: {result}")
+        else:
+            print("[-] Hash not cracked.")
+
+    finally:
+        for p in pool:
+            p.terminate()
+            p.join()
 
 def gpu_brute_force_hashcat(hash_to_crack, hash_type):
     hashcat_path = 'hashcat'  # assumes in PATH
